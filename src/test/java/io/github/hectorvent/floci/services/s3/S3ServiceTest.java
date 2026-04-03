@@ -107,6 +107,32 @@ class S3ServiceTest {
     }
 
     @Test
+    void putAndGetZeroByteObject() {
+        s3Service.createBucket("test-bucket", "us-east-1");
+        byte[] data = new byte[0];
+        S3Object put = s3Service.putObject("test-bucket", "empty.txt", data, "application/octet-stream", null);
+
+        assertNotNull(put.getETag());
+        assertEquals(0, put.getSize());
+
+        S3Object got = s3Service.getObject("test-bucket", "empty.txt");
+        assertArrayEquals(data, got.getData());
+        assertEquals(0, got.getSize());
+        assertEquals("application/octet-stream", got.getContentType());
+    }
+
+    @Test
+    void putZeroByteObjectWritesEmptyFileToDisk() {
+        s3Service.createBucket("test-bucket", "us-east-1");
+        byte[] data = new byte[0];
+        s3Service.putObject("test-bucket", "empty.dat", data, null, null);
+
+        Path filePath = tempDir.resolve("s3/test-bucket/empty.dat.s3data");
+        assertTrue(Files.exists(filePath));
+        assertArrayEquals(data, assertDoesNotThrow(() -> Files.readAllBytes(filePath)));
+    }
+
+    @Test
     void putObjectWritesFileToDisk() {
         s3Service.createBucket("test-bucket", "us-east-1");
         byte[] data = "file content".getBytes(StandardCharsets.UTF_8);
