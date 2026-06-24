@@ -1402,6 +1402,15 @@ public class S3Service {
         return bucket.getPolicy();
     }
 
+    /**
+     * Returns the bucket policy document, or {@code null} if the bucket has no policy
+     * (or does not exist). Unlike {@link #getBucketPolicy(String)} this never throws,
+     * so callers evaluating policies on the request hot path can stay branch-light.
+     */
+    public String getBucketPolicyOrNull(String bucketName) {
+        return bucketStore.get(bucketName).map(Bucket::getPolicy).orElse(null);
+    }
+
     public void putBucketPolicy(String bucketName, String policy) {
         Bucket bucket = bucketStore.get(bucketName)
                 .orElseThrow(() -> new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404));
