@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.s3;
 import static io.github.hectorvent.floci.services.s3.S3RequestParser.hasQueryParam;
 
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsNamespaces;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
@@ -92,19 +93,22 @@ public class S3Controller {
     private final SnsQueryHandler snsQueryHandler;
     private final io.quarkus.vertx.http.runtime.CurrentVertxRequest currentVertxRequest;
     private final io.github.hectorvent.floci.services.floci.ui.UiPages uiPages;
+    private final EmulatorConfig config;
 
     @Inject
     public S3Controller(S3Service s3Service, S3SelectService s3SelectService,
                         RegionResolver regionResolver,
                         SnsQueryHandler snsQueryHandler,
                         io.quarkus.vertx.http.runtime.CurrentVertxRequest currentVertxRequest,
-                        io.github.hectorvent.floci.services.floci.ui.UiPages uiPages) {
+                        io.github.hectorvent.floci.services.floci.ui.UiPages uiPages,
+                        EmulatorConfig config) {
         this.s3Service = s3Service;
         this.s3SelectService = s3SelectService;
         this.regionResolver = regionResolver;
         this.snsQueryHandler = snsQueryHandler;
         this.currentVertxRequest = currentVertxRequest;
         this.uiPages = uiPages;
+        this.config = config;
     }
 
     // --- Bucket operations ---
@@ -639,6 +643,14 @@ public class S3Controller {
                 }
             }
             S3Object obj = s3Service.headObject(bucket, key, versionId);
+
+            // CloudFront OAC emulation: when the request arrives via the CloudFront domain,
+            // enforce the bucket policy's object-tag conditions (e.g. visibility=private Deny),
+            // mirroring how a real distribution + OAC bucket policy gates GetObject by tag.
+            if (isCloudFrontOriginRequest(httpHeaders) && isDeniedByBucketTagPolicy(bucket, obj)) {
+                return xmlErrorResponse(new AwsException("AccessDenied", "Access Denied", 403));
+            }
+
             S3Service.validateSseCustomerAccess(
                     obj,
                     httpHeaders.getHeaderString("x-amz-server-side-encryption-customer-algorithm"),
@@ -668,6 +680,113 @@ public class S3Controller {
             }
             return xmlErrorResponse(e);
         }
+    }
+
+    /**
+     * Whether the request arrived via the emulated CloudFront domain (Host ends with the
+     * configured cloudfront domain-suffix, e.g. {@code <id>.cloudfront.local}). Used to scope
+     * OAC bucket-policy enforcement to the CDN path; direct S3 access is unaffected.
+     */
+    private boolean isCloudFrontOriginRequest(HttpHeaders httpHeaders) {
+        String host = httpHeaders.getHeaderString("Host");
+        if (host == null || host.isBlank()) {
+            return false;
+        }
+        int colon = host.indexOf(':');
+        if (colon >= 0) {
+            host = host.substring(0, colon);
+        }
+        String suffix = config.services().cloudfront().domainSuffix();
+        if (suffix == null || suffix.isBlank()) {
+            return false;
+        }
+        host = host.toLowerCase();
+        suffix = suffix.toLowerCase();
+        return host.equals(suffix) || host.endsWith("." + suffix);
+    }
+
+    /**
+     * Evaluates the bucket policy against the object's tags and returns {@code true} when a
+     * {@code Deny} statement's {@code s3:ExistingObjectTag/<key>} StringEquals condition matches
+     * one of the object's tags. This is a minimal, policy-driven emulation of the OAC
+     * "deny private-tagged objects" pattern: it reads the stored policy rather than hardcoding
+     * any tag convention, so it honors whatever bucket policy the user applies.
+     */
+    private boolean isDeniedByBucketTagPolicy(String bucketName, S3Object obj) {
+        String policy = s3Service.getBucketPolicyOrNull(bucketName);
+        if (policy == null || policy.isBlank()) {
+            return false;
+        }
+        // Tags may be absent; that is significant for StringNotEquals (an untagged object is denied
+        // by a "deny unless visibility=public" policy), so we keep an empty map rather than bailing out.
+        Map<String, String> tags = obj.getTags() != null ? obj.getTags() : Map.of();
+        try {
+            JsonNode statements = OBJECT_MAPPER.readTree(policy).path("Statement");
+            if (!statements.isArray()) {
+                return false;
+            }
+            for (JsonNode statement : statements) {
+                if (!"Deny".equalsIgnoreCase(statement.path("Effect").asText())) {
+                    continue;
+                }
+                JsonNode condition = statement.path("Condition");
+                // StringEquals: deny when an object tag equals the condition value (e.g. visibility=private).
+                if (matchesTagCondition(condition.path("StringEquals"), tags, true)) {
+                    return true;
+                }
+                // StringNotEquals: deny when an object tag differs from the condition value, or is absent
+                // (e.g. "deny unless visibility=public" — blocks both private and untagged objects).
+                if (matchesTagCondition(condition.path("StringNotEquals"), tags, false)) {
+                    return true;
+                }
+            }
+        } catch (Exception e) {
+            // Lenient: a malformed policy must never break object serving.
+            return false;
+        }
+        return false;
+    }
+
+    /**
+     * Evaluates the {@code s3:ExistingObjectTag/<key>} entries of a StringEquals / StringNotEquals
+     * condition block against the object's tags.
+     *
+     * @param equals {@code true} for StringEquals (match when a tag value equals a condition value);
+     *               {@code false} for StringNotEquals (match when a tag value differs, treating an
+     *               absent tag as "not equal" per AWS missing-key semantics).
+     */
+    private boolean matchesTagCondition(JsonNode conditionBlock, Map<String, String> tags, boolean equals) {
+        if (!conditionBlock.isObject()) {
+            return false;
+        }
+        Iterator<Map.Entry<String, JsonNode>> fields = conditionBlock.fields();
+        while (fields.hasNext()) {
+            Map.Entry<String, JsonNode> field = fields.next();
+            String conditionKey = field.getKey();
+            if (!conditionKey.startsWith("s3:ExistingObjectTag/")) {
+                continue;
+            }
+            String tagKey = conditionKey.substring("s3:ExistingObjectTag/".length());
+            String objectTagValue = tags.get(tagKey);
+            boolean valueEquals = objectTagValue != null && conditionValueMatches(field.getValue(), objectTagValue);
+            if (equals ? valueEquals : !valueEquals) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** A policy condition value may be a single string or an array of strings. */
+    private boolean conditionValueMatches(JsonNode conditionValue, String objectTagValue) {
+        if (conditionValue.isArray()) {
+            for (JsonNode value : conditionValue) {
+                if (objectTagValue.equals(value.asText())) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        return objectTagValue.equals(conditionValue.asText());
     }
 
     private Response fullObjectResponse(String bucket, String key, String versionId,
@@ -802,6 +921,12 @@ public class S3Controller {
         try {
             key = extractObjectKey(uriInfo, bucket);
             S3Object obj = s3Service.headObject(bucket, key, versionId);
+
+            // CloudFront OAC emulation (HEAD): same tag-based gating as GET via the CloudFront domain.
+            if (isCloudFrontOriginRequest(httpHeaders) && isDeniedByBucketTagPolicy(bucket, obj)) {
+                return xmlErrorResponse(new AwsException("AccessDenied", "Access Denied", 403));
+            }
+
             S3Service.validateSseCustomerAccess(
                     obj,
                     httpHeaders.getHeaderString("x-amz-server-side-encryption-customer-algorithm"),
