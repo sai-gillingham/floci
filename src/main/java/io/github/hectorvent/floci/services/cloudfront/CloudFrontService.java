@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.services.cloudfront.model.CloudFrontFunction;
 import io.github.hectorvent.floci.services.cloudfront.model.CloudFrontOriginAccessIdentity;
 import io.github.hectorvent.floci.services.cloudfront.model.ContinuousDeploymentPolicy;
 import io.github.hectorvent.floci.services.cloudfront.model.Distribution;
+import io.github.hectorvent.floci.services.cloudfront.model.DistributionConfig;
 import io.github.hectorvent.floci.services.cloudfront.model.FieldLevelEncryptionConfig;
 import io.github.hectorvent.floci.services.cloudfront.model.FieldLevelEncryptionProfile;
 import io.github.hectorvent.floci.services.cloudfront.model.Invalidation;
@@ -30,6 +31,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.function.Function;
 
@@ -171,6 +173,53 @@ public class CloudFrontService {
             return all.subList(0, maxItems);
         }
         return all;
+    }
+
+    /**
+     * Resolves the distribution that serves the given request hostname.
+     *
+     * <p>Matches against the distribution's generated domain name
+     * ({@code <id>.<domainSuffix>}) as well as any configured aliases (CNAMEs).
+     * This lets viewer requests such as {@code d123.cloudfront.net/images/x.png}
+     * be routed to the distribution's S3 origin without exposing the bucket in
+     * the URL, mirroring real CloudFront behavior.
+     *
+     * @param host the request hostname, with any port already stripped
+     * @return the matching distribution, or empty if none matches
+     */
+    public Optional<Distribution> findDistributionByDomain(String host) {
+        if (host == null || host.isBlank()) {
+            return Optional.empty();
+        }
+
+        // Fast path: <id>.<domainSuffix> — extract the ID and look it up directly.
+        String suffix = "." + domainSuffix.toLowerCase();
+        String lowerHost = host.toLowerCase();
+        if (lowerHost.endsWith(suffix)) {
+            String id = host.substring(0, host.length() - suffix.length());
+            if (!id.isEmpty() && id.indexOf('.') < 0) {
+                Optional<Distribution> byId = distStore.get(id);
+                if (byId.isPresent()) {
+                    return byId;
+                }
+            }
+        }
+
+        // Match by exact generated domain name or a configured alias (CNAME).
+        for (Distribution dist : distStore.scan(k -> true)) {
+            if (host.equalsIgnoreCase(dist.getDomainName())) {
+                return Optional.of(dist);
+            }
+            DistributionConfig cfg = dist.getConfig();
+            if (cfg != null && cfg.getAliases() != null) {
+                for (String alias : cfg.getAliases()) {
+                    if (host.equalsIgnoreCase(alias)) {
+                        return Optional.of(dist);
+                    }
+                }
+            }
+        }
+        return Optional.empty();
     }
 
     public synchronized void associateAlias(String targetDistributionId, String alias) {

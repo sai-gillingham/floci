@@ -4,13 +4,18 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.cloudfront.model.Distribution;
+import io.github.hectorvent.floci.services.cloudfront.model.DistributionConfig;
 import io.github.hectorvent.floci.services.cloudfront.model.StreamingDistribution;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.mockito.Mockito.when;
 
 class CloudFrontServiceTest {
@@ -62,5 +67,40 @@ class CloudFrontServiceTest {
 
         assertTrue(sd.getDomainName().endsWith(".cloudfront.local"),
                 "Expected configured suffix, got: " + sd.getDomainName());
+    }
+
+    @Test
+    void findsDistributionByGeneratedDomainName() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.local");
+        Distribution dist = service.createDistribution(new Distribution(), Map.of());
+
+        Optional<Distribution> found = service.findDistributionByDomain(dist.getDomainName());
+
+        assertTrue(found.isPresent());
+        assertEquals(dist.getId(), found.get().getId());
+    }
+
+    @Test
+    void findsDistributionByAlias() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.local");
+        Distribution dist = new Distribution();
+        DistributionConfig cfg = new DistributionConfig();
+        cfg.setAliases(List.of("cdn.example.com"));
+        dist.setConfig(cfg);
+        Distribution created = service.createDistribution(dist, Map.of());
+
+        Optional<Distribution> found = service.findDistributionByDomain("cdn.example.com");
+
+        assertTrue(found.isPresent());
+        assertEquals(created.getId(), found.get().getId());
+    }
+
+    @Test
+    void returnsEmptyForUnknownDomain() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.local");
+        service.createDistribution(new Distribution(), Map.of());
+
+        assertFalse(service.findDistributionByDomain("unknown.cloudfront.local").isPresent());
+        assertFalse(service.findDistributionByDomain("some.random.host").isPresent());
     }
 }
