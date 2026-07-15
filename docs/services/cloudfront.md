@@ -1,6 +1,6 @@
 # CloudFront
 
-CloudFront management-plane emulation. Supports distribution lifecycle, cache policies, origin request policies, response headers policies, origin access controls, origin access identities, CloudFront Functions, invalidations, and tagging. Actual content delivery is not emulated — this is a management-plane-only implementation.
+CloudFront management-plane emulation. Supports distribution lifecycle, cache policies, origin request policies, response headers policies, origin access controls, origin access identities, CloudFront Functions, invalidations, resource policies, and tagging. Actual content delivery is not emulated — this is a management-plane-only implementation.
 
 **Protocol:** REST XML  
 **API version:** `2020-05-31`  
@@ -105,6 +105,14 @@ CloudFront management-plane emulation. Supports distribution lifecycle, cache po
 | `TagResource` | POST | `/2020-05-31/tagging?Operation=Tag&Resource={arn}` |
 | `UntagResource` | POST | `/2020-05-31/tagging?Operation=Untag&Resource={arn}` |
 
+### Resource Policies
+
+| Operation | Method | Path |
+|---|---|---|
+| `PutResourcePolicy` | POST | `/2020-05-31/put-resource-policy` |
+| `GetResourcePolicy` | POST | `/2020-05-31/get-resource-policy` |
+| `DeleteResourcePolicy` | POST | `/2020-05-31/delete-resource-policy` |
+
 ## Behavior
 
 - All distributions are immediately set to `Deployed` state (no async `InProgress` delay).
@@ -113,8 +121,9 @@ CloudFront management-plane emulation. Supports distribution lifecycle, cache po
 - ARNs are global — no region segment: `arn:aws:cloudfront::{accountId}:distribution/{id}`.
 - Invalidations are immediately marked `Completed`.
 - `DeleteDistribution` returns `DistributionNotDisabled` (409) if `Enabled` is `true` in the config.
-- All mutating operations (`PUT`, `DELETE`) require an `If-Match` header containing the current `ETag`. A missing or incorrect `ETag` returns `InvalidIfMatchVersion` (400).
-- All `GET` and `POST` (create) responses include an `ETag` response header.
+- Most mutable resource lifecycle operations (`PUT`, `DELETE`) require an `If-Match` header containing the current `ETag`. Resource policy and tagging operations do not use `ETag`.
+- `PutResourcePolicy` requires the target resource to already exist — an unknown `ResourceArn` returns `EntityNotFound` (404), matching real CloudFront. Existence is checked against emulated `distribution`, `streaming-distribution`, and `realtime-log-config` resources.
+- Resource policy documents must be a well-formed IAM resource-based (resource control) policy: a JSON object with a `Version` of `2012-10-17` or `2008-10-17` and a non-empty `Statement`; each statement requires an `Effect` of `Allow`/`Deny`, a `Principal`/`NotPrincipal`, and an `Action`/`NotAction` (`Sid`, `Resource`/`NotResource`, and `Condition` are optional). Violations return `InvalidArgument` (400). Policies are stored by `ResourceArn`; **authorization is not evaluated** — the emulator does not allow or deny requests based on a stored policy (there is no cross-account caller identity to evaluate against).
 - All list-type sub-elements in XML follow CloudFront's `<Quantity>N</Quantity><Items>...</Items>` wrapper pattern.
 - OAI `CallerReference` uniqueness is enforced — duplicate `CallerReference` values return `CloudFrontOriginAccessIdentityAlreadyExists` (409).
 - `AssociateAlias` attaches a CNAME alias to the target distribution's config.
@@ -199,6 +208,24 @@ aws cloudfront create-cache-policy --cache-policy-config '{
     "QueryStringsConfig": {"QueryStringBehavior": "none"}
   }
 }'
+
+# Put, get, and delete a resource policy.
+# The target resource must already exist, so derive the ARN from a real distribution.
+DIST_ARN=$(aws cloudfront get-distribution --id E1Z2X3C4V5B6N7 \
+  --query 'Distribution.ARN' --output text)
+aws cloudfront put-resource-policy \
+  --resource-arn "$DIST_ARN" \
+  --policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "cloudfront:GetDistribution",
+      "Resource": "*"
+    }]
+  }'
+aws cloudfront get-resource-policy --resource-arn "$DIST_ARN"
+aws cloudfront delete-resource-policy --resource-arn "$DIST_ARN"
 
 # Disable and delete a distribution
 ETAG=$(aws cloudfront get-distribution --id E1Z2X3C4V5B6N7 \

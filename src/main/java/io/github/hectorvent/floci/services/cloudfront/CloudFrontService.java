@@ -1,6 +1,8 @@
 package io.github.hectorvent.floci.services.cloudfront;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
@@ -20,6 +22,7 @@ import io.github.hectorvent.floci.services.cloudfront.model.OriginRequestPolicy;
 import io.github.hectorvent.floci.services.cloudfront.model.PublicKey;
 import io.github.hectorvent.floci.services.cloudfront.model.RealtimeLogConfig;
 import io.github.hectorvent.floci.services.cloudfront.model.ResponseHeadersPolicy;
+import io.github.hectorvent.floci.services.cloudfront.model.ResourcePolicy;
 import io.github.hectorvent.floci.services.cloudfront.model.StreamingDistribution;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -27,6 +30,7 @@ import jakarta.inject.Inject;
 import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -38,6 +42,7 @@ public class CloudFrontService {
 
     private static final String CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     private static final SecureRandom RANDOM = new SecureRandom();
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     private final StorageBackend<String, Distribution> distStore;
     private final StorageBackend<String, List<Invalidation>> invalidationStore;
@@ -48,6 +53,7 @@ public class CloudFrontService {
     private final StorageBackend<String, CloudFrontOriginAccessIdentity> oaiStore;
     private final StorageBackend<String, CloudFrontFunction> functionStore;
     private final StorageBackend<String, Map<String, String>> tagStore;
+    private final StorageBackend<String, ResourcePolicy> resourcePolicyStore;
     private final StorageBackend<String, ContinuousDeploymentPolicy> cdpStore;
     private final StorageBackend<String, PublicKey> publicKeyStore;
     private final StorageBackend<String, KeyGroup> keyGroupStore;
@@ -79,6 +85,8 @@ public class CloudFrontService {
                 new TypeReference<Map<String, CloudFrontFunction>>() {});
         this.tagStore = factory.create("cloudfront", "cloudfront-tags.json",
                 new TypeReference<Map<String, Map<String, String>>>() {});
+        this.resourcePolicyStore = factory.create("cloudfront", "cloudfront-resource-policies.json",
+                new TypeReference<Map<String, ResourcePolicy>>() {});
         this.cdpStore = factory.create("cloudfront", "cloudfront-continuous-deployment-policies.json",
                 new TypeReference<Map<String, ContinuousDeploymentPolicy>>() {});
         this.publicKeyStore = factory.create("cloudfront", "cloudfront-public-keys.json",
@@ -626,6 +634,28 @@ public class CloudFrontService {
         tagStore.put(arn, existing);
     }
 
+    // ── Resource Policies ────────────────────────────────────────────────────
+
+    public synchronized ResourcePolicy putResourcePolicy(ResourcePolicy policy) {
+        validateResourceArn(policy != null ? policy.getResourceArn() : null);
+        validatePolicyDocument(policy.getPolicyDocument());
+        assertResourceExists(policy.getResourceArn());
+        resourcePolicyStore.put(policy.getResourceArn(), policy);
+        return policy;
+    }
+
+    public ResourcePolicy getResourcePolicy(String resourceArn) {
+        validateResourceArn(resourceArn);
+        return resourcePolicyStore.get(resourceArn).orElseThrow(() ->
+                new AwsException("EntityNotFound",
+                        "The specified CloudFront resource policy does not exist.", 404));
+    }
+
+    public synchronized void deleteResourcePolicy(String resourceArn) {
+        getResourcePolicy(resourceArn);
+        resourcePolicyStore.delete(resourceArn);
+    }
+
     // ── Continuous Deployment Policies ───────────────────────────────────────
 
     public synchronized ContinuousDeploymentPolicy createContinuousDeploymentPolicy(
@@ -996,6 +1026,178 @@ public class CloudFrontService {
             sb.append(CHARS.charAt(RANDOM.nextInt(CHARS.length())));
         }
         return sb.toString();
+    }
+
+    private static void validateResourceArn(String resourceArn) {
+        if (resourceArn == null || resourceArn.isBlank()) {
+            throw new AwsException("InvalidArgument", "The ResourceArn parameter is required.", 400);
+        }
+        if (!resourceArn.matches("arn:[^:]+:cloudfront::[^:]+:.+")) {
+            throw new AwsException("InvalidArgument", "The ResourceArn parameter is invalid.", 400);
+        }
+    }
+
+    /**
+     * Verifies that the CloudFront resource targeted by the policy exists, matching real
+     * CloudFront which returns {@code EntityNotFound} from {@code PutResourcePolicy} when the
+     * resource is unknown. Only resource types this emulator models can exist; any other type
+     * (or a missing id) is treated as not found.
+     */
+    private void assertResourceExists(String resourceArn) {
+        String[] parts = resourceArn.split(":", 6);
+        String resourcePart = parts.length == 6 ? parts[5] : "";
+        int slash = resourcePart.indexOf('/');
+        String type = slash >= 0 ? resourcePart.substring(0, slash) : resourcePart;
+        String id = slash >= 0 ? resourcePart.substring(slash + 1) : "";
+        boolean exists = switch (type) {
+            case "distribution" -> distStore.get(id).isPresent();
+            case "streaming-distribution" -> streamingDistStore.get(id).isPresent();
+            case "realtime-log-config" -> realtimeLogConfigStore.get(id).isPresent();
+            default -> false;
+        };
+        if (!exists) {
+            throw new AwsException("EntityNotFound",
+                    "The specified CloudFront resource does not exist.", 404);
+        }
+    }
+
+    /**
+     * Validates that {@code policyDocument} is a well-formed IAM resource-based (resource control)
+     * policy, the grammar CloudFront enforces server-side. Any violation is reported as
+     * {@code InvalidArgument} (400), matching the real service.
+     */
+    private static void validatePolicyDocument(String policyDocument) {
+        if (policyDocument == null || policyDocument.isBlank()) {
+            throw new AwsException("InvalidArgument", "The PolicyDocument parameter is required.", 400);
+        }
+        JsonNode root;
+        try {
+            root = OBJECT_MAPPER.readTree(policyDocument);
+        } catch (Exception e) {
+            throw new AwsException("InvalidArgument", "The policy document is not valid JSON.", 400);
+        }
+        if (!root.isObject()) {
+            throw new AwsException("InvalidArgument", "The policy document must be a JSON object.", 400);
+        }
+
+        JsonNode version = root.get("Version");
+        if (version == null || !version.isTextual()) {
+            throw new AwsException("InvalidArgument",
+                    "The policy document must include a Version element.", 400);
+        }
+        if (!"2012-10-17".equals(version.asText()) && !"2008-10-17".equals(version.asText())) {
+            throw new AwsException("InvalidArgument",
+                    "The policy Version must be \"2012-10-17\" or \"2008-10-17\".", 400);
+        }
+
+        JsonNode statement = root.get("Statement");
+        if (statement == null) {
+            throw new AwsException("InvalidArgument",
+                    "The policy document must include a Statement element.", 400);
+        }
+        if (statement.isArray()) {
+            if (statement.isEmpty()) {
+                throw new AwsException("InvalidArgument",
+                        "The policy Statement must not be empty.", 400);
+            }
+            for (JsonNode stmt : statement) {
+                validateStatement(stmt);
+            }
+        } else if (statement.isObject()) {
+            validateStatement(statement);
+        } else {
+            throw new AwsException("InvalidArgument",
+                    "The policy Statement must be a JSON object or array of objects.", 400);
+        }
+    }
+
+    private static void validateStatement(JsonNode stmt) {
+        if (!stmt.isObject()) {
+            throw new AwsException("InvalidArgument",
+                    "Each policy Statement must be a JSON object.", 400);
+        }
+        JsonNode effect = stmt.get("Effect");
+        if (effect == null || !effect.isTextual()
+                || (!"Allow".equals(effect.asText()) && !"Deny".equals(effect.asText()))) {
+            throw new AwsException("InvalidArgument",
+                    "Each policy Statement must include an Effect of \"Allow\" or \"Deny\".", 400);
+        }
+        // Resource-based policies must identify a principal.
+        if (!stmt.has("Principal") && !stmt.has("NotPrincipal")) {
+            throw new AwsException("InvalidArgument",
+                    "Each policy Statement must include a Principal or NotPrincipal element.", 400);
+        }
+        if (stmt.has("Principal")) {
+            validatePrincipal(stmt.get("Principal"));
+        }
+        if (stmt.has("NotPrincipal")) {
+            validatePrincipal(stmt.get("NotPrincipal"));
+        }
+        if (!stmt.has("Action") && !stmt.has("NotAction")) {
+            throw new AwsException("InvalidArgument",
+                    "Each policy Statement must include an Action or NotAction element.", 400);
+        }
+        if (stmt.has("Action")) {
+            validateStringOrStringArray(stmt.get("Action"), "Action");
+        }
+        if (stmt.has("NotAction")) {
+            validateStringOrStringArray(stmt.get("NotAction"), "NotAction");
+        }
+        if (stmt.has("Resource")) {
+            validateStringOrStringArray(stmt.get("Resource"), "Resource");
+        }
+        if (stmt.has("NotResource")) {
+            validateStringOrStringArray(stmt.get("NotResource"), "NotResource");
+        }
+        if (stmt.has("Condition") && !stmt.get("Condition").isObject()) {
+            throw new AwsException("InvalidArgument",
+                    "The policy Statement Condition must be a JSON object.", 400);
+        }
+    }
+
+    private static void validatePrincipal(JsonNode principal) {
+        if (principal.isTextual()) {
+            if (!"*".equals(principal.asText())) {
+                throw new AwsException("InvalidArgument",
+                        "A policy Principal string value must be \"*\".", 400);
+            }
+            return;
+        }
+        if (principal.isObject()) {
+            if (principal.isEmpty()) {
+                throw new AwsException("InvalidArgument",
+                        "A policy Principal object must not be empty.", 400);
+            }
+            Iterator<Map.Entry<String, JsonNode>> fields = principal.fields();
+            while (fields.hasNext()) {
+                Map.Entry<String, JsonNode> field = fields.next();
+                validateStringOrStringArray(field.getValue(), "Principal " + field.getKey());
+            }
+            return;
+        }
+        throw new AwsException("InvalidArgument",
+                "A policy Principal must be \"*\" or a JSON object.", 400);
+    }
+
+    private static void validateStringOrStringArray(JsonNode node, String field) {
+        if (node.isTextual()) {
+            return;
+        }
+        if (node.isArray()) {
+            if (node.isEmpty()) {
+                throw new AwsException("InvalidArgument",
+                        "The policy " + field + " array must not be empty.", 400);
+            }
+            for (JsonNode element : node) {
+                if (!element.isTextual()) {
+                    throw new AwsException("InvalidArgument",
+                            "The policy " + field + " must contain only string values.", 400);
+                }
+            }
+            return;
+        }
+        throw new AwsException("InvalidArgument",
+                "The policy " + field + " must be a string or array of strings.", 400);
     }
 
     private <T> List<T> paginate(List<T> all, String marker, int maxItems,

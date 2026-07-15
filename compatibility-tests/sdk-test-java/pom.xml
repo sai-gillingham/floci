@@ -240,6 +240,11 @@
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>cloudwatch</artifactId>
         </dependency>
+        <!-- CloudFront management client -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>cloudfront</artifactId>
+        </dependency>
         <!-- Secrets Manager client -->
         <dependency>
             <groupId>software.amazon.awssdk</groupId>

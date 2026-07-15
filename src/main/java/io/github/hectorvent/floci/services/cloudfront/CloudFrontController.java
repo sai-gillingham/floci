@@ -976,6 +976,55 @@ public class CloudFrontController {
         }
     }
 
+    // ── Resource Policies ────────────────────────────────────────────────────
+
+    @POST
+    @Path("/put-resource-policy")
+    public Response putResourcePolicy(String body) {
+        try {
+            ResourcePolicy policy = parseResourcePolicy(body);
+            policy = service.putResourcePolicy(policy);
+            String xml = new XmlBuilder()
+                    .start("PutResourcePolicyResult", NS)
+                    .elem("ResourceArn", policy.getResourceArn())
+                    .end("PutResourcePolicyResult")
+                    .build();
+            return Response.ok(xml, XML).build();
+        } catch (AwsException e) {
+            return xmlErrorResponse(e);
+        }
+    }
+
+    @POST
+    @Path("/get-resource-policy")
+    public Response getResourcePolicy(String body) {
+        try {
+            String resourceArn = XmlParser.extractFirst(body, "ResourceArn", null);
+            ResourcePolicy policy = service.getResourcePolicy(resourceArn);
+            String xml = new XmlBuilder()
+                    .start("GetResourcePolicyResult", NS)
+                    .elem("ResourceArn", policy.getResourceArn())
+                    .elem("PolicyDocument", policy.getPolicyDocument())
+                    .end("GetResourcePolicyResult")
+                    .build();
+            return Response.ok(xml, XML).build();
+        } catch (AwsException e) {
+            return xmlErrorResponse(e);
+        }
+    }
+
+    @POST
+    @Path("/delete-resource-policy")
+    public Response deleteResourcePolicy(String body) {
+        try {
+            String resourceArn = XmlParser.extractFirst(body, "ResourceArn", null);
+            service.deleteResourcePolicy(resourceArn);
+            return Response.ok("", XML).build();
+        } catch (AwsException e) {
+            return xmlErrorResponse(e);
+        }
+    }
+
     // ── Continuous Deployment Policies ───────────────────────────────────────
 
     @POST
@@ -2506,6 +2555,12 @@ public class CloudFrontController {
         fn.setRuntime(XmlParser.extractFirst(body, "Runtime", "cloudfront-js-2.0"));
         fn.setFunctionCode(XmlParser.extractFirst(body, "FunctionCode", null));
         return fn;
+    }
+
+    private ResourcePolicy parseResourcePolicy(String body) {
+        return new ResourcePolicy(
+                XmlParser.extractFirst(body, "ResourceArn", null),
+                XmlParser.extractFirst(body, "PolicyDocument", null));
     }
 
     // ── Phase 2 XML builders ──────────────────────────────────────────────────
