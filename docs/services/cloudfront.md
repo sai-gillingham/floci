@@ -1,6 +1,6 @@
 # CloudFront
 
-CloudFront management-plane emulation. Supports distribution lifecycle, cache policies, origin request policies, response headers policies, origin access controls, origin access identities, CloudFront Functions, invalidations, and tagging. Actual content delivery is not emulated — this is a management-plane-only implementation.
+CloudFront emulation. Supports distribution lifecycle, cache policies, origin request policies, response headers policies, origin access controls, origin access identities, CloudFront Functions, invalidations, and tagging. Basic content delivery for S3 origins is emulated: viewer requests to a distribution's domain are routed to the origin bucket. Caching, TTL enforcement, CloudFront Functions execution, and custom (non-S3) origins are not emulated.
 
 **Protocol:** REST XML  
 **API version:** `2020-05-31`  
@@ -119,6 +119,19 @@ CloudFront management-plane emulation. Supports distribution lifecycle, cache po
 - OAI `CallerReference` uniqueness is enforced — duplicate `CallerReference` values return `CloudFrontOriginAccessIdentityAlreadyExists` (409).
 - `AssociateAlias` attaches a CNAME alias to the target distribution's config.
 
+## Content Delivery
+
+Viewer requests sent to a distribution's domain are served from its S3 origin, matching real CloudFront — the origin bucket name never appears in the viewer URL.
+
+- A request is routed when its `Host` header matches a distribution's generated domain name (`{id}.{domain-suffix}`) or one of its configured aliases (CNAMEs). For this to reach Floci, point the distribution domain at Floci's address (e.g. via `/etc/hosts`, custom DNS, or `FLOCI_HOSTNAME`).
+- The target origin is resolved from the distribution config: the first matching cache behavior `PathPattern` wins, otherwise the default cache behavior's `TargetOriginId` is used (falling back to the first origin).
+- The bucket is derived from the S3 origin's `DomainName` (e.g. `mybucket.s3.us-east-1.amazonaws.com` → `mybucket`). The request is rewritten to path-style S3 form: `/{bucket}{OriginPath}{key}`.
+- For a request to `/`, the distribution's `DefaultRootObject` is served if configured.
+
+Example: with an origin of `mybucket.s3.amazonaws.com`, a viewer request to `https://{id}.cloudfront.net/images/logo.png` returns the `images/logo.png` object from `mybucket` — no bucket prefix needed in the URL.
+
+Only S3 origins are supported. Requests for non-S3 (custom) origins, or for disabled distributions, are not routed. Caching, TTLs, invalidation enforcement, signed URLs/cookies, and CloudFront Functions/Lambda@Edge execution are not applied.
+
 ## Configuration
 
 | Property | Env var | Default | Description |
@@ -222,4 +235,5 @@ aws cloudfront delete-distribution --id E1Z2X3C4V5B6N7 --if-match "$ETAG"
 - Streaming distributions (RTMP — deprecated by AWS)
 - VPC origins, Anycast IP lists, key value stores
 - Monitoring subscriptions
-- Actual CDN content delivery and caching
+- Content delivery for custom (non-S3) origins
+- CDN caching, TTL enforcement, signed URLs/cookies, and geo/WAF restrictions
